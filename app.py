@@ -35,16 +35,14 @@ def compare_expiries(symbol, target_strike, curr_price):
     tk = yf.Ticker(symbol)
     comparison_data = []
     
-    # Check every single expiration date available
     for expiry in tk.options:
         try:
             expiry_dt = datetime.strptime(expiry, '%Y-%m-%d')
             dte = (expiry_dt - datetime.now()).days
             
-            # Filter: Must be in the future AND no more than 60 days out
-            if 0 < dte <= 60:
+            # Show up to 90 days to ensure 60 is fully covered
+            if 0 < dte <= 90:
                 chain = tk.option_chain(expiry).puts
-                # Find the strike closest to your target
                 idx = (chain['strike'] - target_strike).abs().idxmin()
                 opt = chain.loc[idx]
                 
@@ -58,7 +56,6 @@ def compare_expiries(symbol, target_strike, curr_price):
                 })
         except: continue
     
-    # Return all found dates sorted by DTE
     df = pd.DataFrame(comparison_data)
     if not df.empty:
         df = df.sort_values("DTE")
@@ -71,7 +68,7 @@ target_strike = st.sidebar.number_input("Target Strike ($)", value=480.0, step=0
 contracts = st.sidebar.number_input("Contracts", value=5, min_value=1)
 
 # --- MAIN ---
-st.title("🛡️ Holdco Expiry Comparison (Full 60-Day Window)")
+st.title("🛡️ Holdco Expiry Comparison (Full View)")
 curr_price, expirations, curr_vix = fetch_ticker_basics(ticker_sym)
 
 if curr_price:
@@ -81,23 +78,26 @@ if curr_price:
     m3.metric("Target Strike", f"${target_strike:.2f}")
 
     st.divider()
-    with st.spinner(f"Analyzing all available expiries for {ticker_sym}..."):
+    with st.spinner(f"Analyzing all available expiries..."):
         df_comp = compare_expiries(ticker_sym, target_strike, curr_price)
     
     if not df_comp.empty:
         # 1. VISUAL CHART
         fig = px.bar(df_comp, x='Expiry', y='Annualized Return', color='Annualized Return', 
                      color_continuous_scale='Blues', text_auto=True, 
-                     title=f"Yield Battle: Annualized Return % (Next {df_comp['DTE'].max()} Days)")
+                     title=f"Yield Battle: Annualized Return %")
         st.plotly_chart(fig, use_container_width=True)
 
-        # 2. DATA TABLE
-        st.subheader(f"Detailed Option Data (Showing {len(df_comp)} Expiries)")
+        # 2. DATA TABLE (Full Display, No Scroll)
+        st.subheader(f"Detailed Option Data ({len(df_comp)} Expiries Found)")
         df_styled = df_comp.copy()
         df_styled['Premium'] = df_styled['Premium'].map("${:,.2f}".format)
         df_styled['IV'] = (df_styled['IV'] * 100).map("{:,.1f}%".format)
         df_styled['Annualized Return'] = df_styled['Annualized Return'].map("{:,.2f}%".format)
-        st.dataframe(df_styled, use_container_width=True, hide_index=True)
+        
+        # Calculate dynamic height: ~35px per row + 40px for header
+        dynamic_height = (len(df_styled) * 35) + 40
+        st.dataframe(df_styled, use_container_width=True, hide_index=True, height=dynamic_height)
 
         # 3. CHECKLIST
         st.divider()
@@ -105,7 +105,6 @@ if curr_price:
         selected_expiry = st.selectbox("Select Expiry for Safety Deep-Dive:", df_comp['Expiry'])
         row = df_comp[df_comp['Expiry'] == selected_expiry].iloc[0]
         
-        # Logic Calc
         total_prem = row['Premium'] * contracts * 100
         safety_margin = ((curr_price - row['Actual Strike']) / curr_price) * 100
         pop = calculate_pop(curr_price, row['Actual Strike'], row['DTE']/365, row['IV'])
@@ -128,7 +127,6 @@ if curr_price:
             st.warning(f"⚖️ **Passive Limit Use:** {(total_prem/50000)*100:.1f}% of $50k")
 
     else: 
-        st.error(f"No valid option data found for {ticker_sym} at a ${target_strike} strike within 60 days.")
-        st.info("Try adjusting the strike price closer to the current market price.")
+        st.error(f"No valid option data found.")
 else: 
     st.error("Invalid Ticker or Connection Issue.")
