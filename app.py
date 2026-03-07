@@ -1,124 +1,104 @@
 import streamlit as st
-import pandas as pd
 import yfinance as yf
+import pandas as pd
 import numpy as np
-from scipy.stats import norm
 from datetime import datetime
+import plotly.express as px
+from scipy.stats import norm
 
-# Page Config
-st.set_page_config(page_title="Technical Comparison Dashboard", layout="wide")
-st.title("📊 4-EMA Benchmark & Options Greeks")
+st.set_page_config(page_title="Holdco Pro: Expiry Battle", layout="wide")
 
-# --- BLACK-SCHOLES ENGINE (Now with Theta) ---
-def calculate_greeks(S, K, T, r, sigma, option_type='put'):
-    if T <= 0 or sigma <= 0: return 0, 0, 0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    
-    # Delta & Gamma
-    if option_type == 'put':
-        delta = norm.cdf(d1) - 1
-    else:
-        delta = norm.cdf(d1)
-    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-    
-    # Theta (Daily Decay)
-    term1 = -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
-    if option_type == 'put':
-        term2 = r * K * np.exp(-r * T) * norm.cdf(-d2)
-        theta = (term1 + term2) / 365.0
-    else:
-        term2 = r * K * np.exp(-r * T) * norm.cdf(d2)
-        theta = (term1 - term2) / 365.0
-        
-    return delta, gamma, theta
+# --- PROBABILITY CALCULATION (Black-Scholes Delta Proxy) ---
+def calculate_pop(S, K, t, sigma, r=0.04):
+    if t <= 0 or sigma <= 0: return 0.5
+    d2 = (np.log(S / K) + (r - 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+    return norm.cdf(d2)
 
-# --- DATA FETCHING ---
+# --- CACHED DATA FETCHING ---
 @st.cache_data(ttl=600)
-def get_technical_data(symbol, interval):
+def fetch_ticker_basics(symbol):
     try:
-        t_obj = yf.Ticker(symbol)
-        df = t_obj.history(period="max", interval=interval)
-        if df.empty or len(df) < 25: return None, None
+        tk = yf.Ticker(symbol)
+        info = tk.info
+        price = info.get('regularMarketPrice') or info.get('previousClose')
+        expirations = tk.options
+        vix_price = yf.Ticker("^VIX").info.get('regularMarketPrice') or yf.Ticker("^VIX").info.get('previousClose', 20.0)
+        return price, expirations, vix_price
+    except:
+        return None, None, None
+
+@st.cache_data(ttl=600)
+def compare_expiries(symbol, target_strike, curr_price):
+    tk = yf.Ticker(symbol)
+    comparison_data = []
+    for expiry in tk.options[:8]:
+        try:
+            chain = tk.option_chain(expiry).puts
+            idx = (chain['strike'] - target_strike).abs().idxmin()
+            opt = chain.loc[idx]
+            dte = (datetime.strptime(expiry, '%Y-%m-%d') - datetime.now()).days
+            if dte <= 0: dte = 1
+            
+            comparison_data.append({
+                "Expiry": expiry,
+                "DTE": dte,
+                "Actual Strike": opt['strike'],
+                "Premium": opt['lastPrice'],
+                "IV": opt['impliedVolatility'],
+                "Annualized Return": round(((opt['lastPrice'] / (opt['strike'] - opt['lastPrice'])) * (365 / dte) * 100), 2)
+            })
+        except: continue
+    return pd.DataFrame(comparison_data)
+
+# --- SIDEBAR ---
+st.sidebar.header("🛡️ Battle Parameters")
+ticker_sym = st.sidebar.text_input("Ticker", value="SPY").upper()
+target_strike = st.sidebar.number_input("Target Strike ($)", value=480.0, step=0.5, format="%.2f")
+contracts = st.sidebar.number_input("Contracts", value=5, min_value=1)
+
+# --- MAIN ---
+st.title("🛡️ Holdco Expiry Comparison")
+curr_price, expirations, curr_vix = fetch_ticker_basics(ticker_sym)
+
+if curr_price:
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"{ticker_sym} Price", f"${curr_price:.2f}")
+    m2.metric("VIX (Fear Index)", f"{curr_vix:.2f}")
+    m3.metric("Target Strike", f"${target_strike:.2f}")
+
+    st.divider()
+    with st.spinner("Scanning Option Chains..."):
+        df_comp = compare_expiries(ticker_sym, target_strike, curr_price)
+    
+    if not df_comp.empty:
+        fig = px.bar(df_comp, x='Expiry', y='Annualized Return', color='Annualized Return', 
+                     color_continuous_scale='Blues', text_auto=True, title="Yield Battle: Annualized Return %")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.subheader("📋 Holdco Battle Checklist")
+        selected_expiry = st.selectbox("Select Expiry for Safety Deep-Dive:", df_comp['Expiry'])
+        row = df_comp[df_comp['Expiry'] == selected_expiry].iloc[0]
         
-        # Technicals
-        df['EMA4'] = df['Close'].ewm(span=4, adjust=False).mean()
-        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        sma20 = df['Close'].rolling(window=20).mean()
-        std20 = df['Close'].rolling(window=20).std()
-        df['BB_Top'] = sma20 + (std20 * 2)
-        df['BB_Bot'] = sma20 - (std20 * 2)
-        df['BB_Width'] = ((df['BB_Top'] - df['BB_Bot']) / sma20) * 100
-        df['%K'] = (df['Close'] - df['Low'].rolling(5).min()) / (df['High'].rolling(5).max() - df['Low'].rolling(5).min()) * 100
+        # Logic Calc
+        total_prem = row['Premium'] * contracts * 100
+        safety_margin = ((curr_price - row['Actual Strike']) / curr_price) * 100
+        pop = calculate_pop(curr_price, row['Actual Strike'], row['DTE']/365, row['IV'])
         
-        return df, t_obj
-    except: return None, None
+        col_a, col_b = st.columns(2)
+        with col_a:
+            def check_ui(label, condition, val):
+                st.markdown(f"{'✅' if condition else '❌'} {label}: **{val}**", unsafe_allow_html=True)
 
-# --- UI ---
-with st.sidebar:
-    st.header("Settings")
-    raw_tickers = st.text_area("Tickers", "AAPL, MSFT, NVDA, SPY")
-    tickers = [t.strip().upper() for t in raw_tickers.split(",") if t.strip()]
+            check_ui("Market Fear (VIX > 20)", curr_vix > 20, f"{curr_vix:.2f}")
+            check_ui("Safety Margin (> 8% OTM)", safety_margin > 8, f"{safety_margin:.1f}%")
+            check_ui("Prob. of Profit (> 80%)", pop > 0.80, f"{pop*100:.1f}%")
+            check_ui("Tax Shield (Premium < $4,166)", total_prem < 4166, f"${total_prem:,.2f}")
+        
+        with col_b:
+            st.info(f"💰 **Cash Required:** ${(row['Actual Strike'] * contracts * 100):,.2f}")
+            st.success(f"🍁 **Tax-Free CDA Credit:** ${(total_prem * 0.5):,.2f}")
+            st.warning(f"⚖️ **Passive Limit Use:** {(total_prem/50000)*100:.1f}% of $50k")
 
-if tickers:
-    grid = st.columns(2)
-    for idx, ticker in enumerate(tickers):
-        with grid[idx % 2]:
-            with st.container(border=True):
-                st.header(ticker)
-                t_d, t_w, t_m = st.tabs(["Daily", "Weekly", "Monthly"])
-                for tab, interval in zip([t_d, t_w, t_m], ["1d", "1wk", "1mo"]):
-                    with tab:
-                        df, t_obj = get_technical_data(ticker, interval)
-                        if df is not None:
-                            last = df.iloc[-1]
-                            curr_p = float(last['Close'])
-                            
-                            st.markdown(f"**Live Price:** `${curr_p:.2f}` | **Stoch:** `{last['%K']:.1f}`")
-
-                            # --- UPDATED OPTIONS SECTION ---
-                            st.markdown("### 🎲 Options Strategy (Targeting 30-60 DTE)")
-                            expirations = list(t_obj.options)
-                            
-                            if expirations:
-                                # Logic to help user find the 30-60 day range
-                                today = datetime.now()
-                                exp_info = []
-                                for ex in expirations:
-                                    d = datetime.strptime(ex, '%Y-%m-%d')
-                                    days = (d - today).days
-                                    exp_info.append(f"{ex} ({days}d)")
-                                
-                                e1, e2 = st.columns(2)
-                                sel_exp_label = e1.selectbox(f"Expiry Selection", exp_info, index=min(5, len(exp_info)-1), key=f"e_{ticker}_{interval}")
-                                sel_exp = sel_exp_label.split(" (")[0]
-                                
-                                # Re-calculate T for Greeks
-                                exp_date = datetime.strptime(sel_exp, '%Y-%m-%d')
-                                DTE = (exp_date - today).days
-                                T = max(DTE, 1) / 365.0
-                                
-                                opt_chain = t_obj.option_chain(sel_exp)
-                                puts = opt_chain.puts
-                                
-                                # Default to At-The-Money strike
-                                atm_idx = (puts['strike'] - curr_p).abs().idxmin()
-                                sel_strike = e2.selectbox(f"Put Strike", puts['strike'].tolist(), index=int(atm_idx), key=f"s_{ticker}_{interval}")
-                                
-                                target_put = puts[puts['strike'] == sel_strike].iloc[0]
-                                iv = target_put['impliedVolatility']
-                                
-                                # Calculate Greeks (Delta, Gamma, Theta)
-                                delta, gamma, theta = calculate_greeks(curr_p, sel_strike, T, 0.04, iv)
-                                
-                                g1, g2, g3, g4 = st.columns(4)
-                                g1.metric("Price", f"${target_put['lastPrice']:.2f}")
-                                g2.metric("Delta", f"{delta:.2f}")
-                                g3.metric("Gamma", f"{gamma:.3f}")
-                                g4.metric("Theta", f"{theta:.2f}")
-                                
-                                if DTE < 30: st.warning(f"⚠️ High Theta Risk: {DTE} days to expiry.")
-                                elif 30 <= DTE <= 60: st.success(f"✅ Ideal DTE Window: {DTE} days.")
-                            
-                            st.divider()
-                            # (Bollinger Analysis & Table follow here...)
+    else: st.error("No valid option data found.")
+else: st.error("Invalid Ticker.")
