@@ -10,9 +10,12 @@ st.set_page_config(page_title="Holdco Pro: Expiry Battle", layout="wide")
 
 # --- PROBABILITY CALCULATION (Black-Scholes Delta Proxy) ---
 def calculate_pop(S, K, t, sigma, r=0.04):
-    if t <= 0 or sigma <= 0: return 0.5
-    d2 = (np.log(S / K) + (r - 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
-    return norm.cdf(d2)
+    try:
+        if t <= 0 or sigma <= 0: return 0.5
+        d2 = (np.log(S / K) + (r - 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
+        return norm.cdf(d2)
+    except:
+        return 0.5
 
 # --- CACHED DATA FETCHING ---
 @st.cache_data(ttl=600)
@@ -31,7 +34,8 @@ def fetch_ticker_basics(symbol):
 def compare_expiries(symbol, target_strike, curr_price):
     tk = yf.Ticker(symbol)
     comparison_data = []
-    for expiry in tk.options[:8]:
+    # Analyzing the first 10 expiries
+    for expiry in tk.options[:10]:
         try:
             chain = tk.option_chain(expiry).puts
             idx = (chain['strike'] - target_strike).abs().idxmin()
@@ -71,10 +75,20 @@ if curr_price:
         df_comp = compare_expiries(ticker_sym, target_strike, curr_price)
     
     if not df_comp.empty:
+        # 1. VISUAL CHART
         fig = px.bar(df_comp, x='Expiry', y='Annualized Return', color='Annualized Return', 
                      color_continuous_scale='Blues', text_auto=True, title="Yield Battle: Annualized Return %")
         st.plotly_chart(fig, use_container_width=True)
 
+        # 2. DATA TABLE (THE MISSING PIECE)
+        st.subheader("Data Overview")
+        df_styled = df_comp.copy()
+        df_styled['Premium'] = df_styled['Premium'].map("${:,.2f}".format)
+        df_styled['IV'] = (df_styled['IV'] * 100).map("{:,.1f}%".format)
+        df_styled['Annualized Return'] = df_styled['Annualized Return'].map("{:,.2f}%".format)
+        st.dataframe(df_styled, use_container_width=True, hide_index=True)
+
+        # 3. CHECKLIST
         st.divider()
         st.subheader("📋 Holdco Battle Checklist")
         selected_expiry = st.selectbox("Select Expiry for Safety Deep-Dive:", df_comp['Expiry'])
@@ -88,7 +102,9 @@ if curr_price:
         col_a, col_b = st.columns(2)
         with col_a:
             def check_ui(label, condition, val):
-                st.markdown(f"{'✅' if condition else '❌'} {label}: **{val}**", unsafe_allow_html=True)
+                color = "green" if condition else "red"
+                icon = "✅" if condition else "❌"
+                st.markdown(f":{color}[{icon} {label}: **{val}**]")
 
             check_ui("Market Fear (VIX > 20)", curr_vix > 20, f"{curr_vix:.2f}")
             check_ui("Safety Margin (> 8% OTM)", safety_margin > 8, f"{safety_margin:.1f}%")
@@ -100,5 +116,5 @@ if curr_price:
             st.success(f"🍁 **Tax-Free CDA Credit:** ${(total_prem * 0.5):,.2f}")
             st.warning(f"⚖️ **Passive Limit Use:** {(total_prem/50000)*100:.1f}% of $50k")
 
-    else: st.error("No valid option data found.")
-else: st.error("Invalid Ticker.")
+    else: st.error("No valid option data found for this strike.")
+else: st.error("Invalid Ticker or Connection Issue.")
