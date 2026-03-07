@@ -8,7 +8,7 @@ from scipy.stats import norm
 
 st.set_page_config(page_title="Holdco Pro: Expiry Battle", layout="wide")
 
-# --- PROBABILITY CALCULATION (Black-Scholes Delta Proxy) ---
+# --- PROBABILITY CALCULATION ---
 def calculate_pop(S, K, t, sigma, r=0.04):
     try:
         if t <= 0 or sigma <= 0: return 0.5
@@ -35,27 +35,34 @@ def compare_expiries(symbol, target_strike, curr_price):
     tk = yf.Ticker(symbol)
     comparison_data = []
     
-    # Iterate through ALL expiries but filter for DTE <= 60
+    # Check every single expiration date available
     for expiry in tk.options:
         try:
-            dte = (datetime.strptime(expiry, '%Y-%m-%d') - datetime.now()).days
-            if dte <= 0: continue
-            if dte > 60: break  # Stop searching once we pass the 60-day mark
+            expiry_dt = datetime.strptime(expiry, '%Y-%m-%d')
+            dte = (expiry_dt - datetime.now()).days
             
-            chain = tk.option_chain(expiry).puts
-            idx = (chain['strike'] - target_strike).abs().idxmin()
-            opt = chain.loc[idx]
-            
-            comparison_data.append({
-                "Expiry": expiry,
-                "DTE": dte,
-                "Actual Strike": opt['strike'],
-                "Premium": opt['lastPrice'],
-                "IV": opt['impliedVolatility'],
-                "Annualized Return": round(((opt['lastPrice'] / (opt['strike'] - opt['lastPrice'])) * (365 / dte) * 100), 2)
-            })
+            # Filter: Must be in the future AND no more than 60 days out
+            if 0 < dte <= 60:
+                chain = tk.option_chain(expiry).puts
+                # Find the strike closest to your target
+                idx = (chain['strike'] - target_strike).abs().idxmin()
+                opt = chain.loc[idx]
+                
+                comparison_data.append({
+                    "Expiry": expiry,
+                    "DTE": dte,
+                    "Actual Strike": opt['strike'],
+                    "Premium": opt['lastPrice'],
+                    "IV": opt['impliedVolatility'],
+                    "Annualized Return": round(((opt['lastPrice'] / (opt['strike'] - opt['lastPrice'])) * (365 / dte) * 100), 2)
+                })
         except: continue
-    return pd.DataFrame(comparison_data)
+    
+    # Return all found dates sorted by DTE
+    df = pd.DataFrame(comparison_data)
+    if not df.empty:
+        df = df.sort_values("DTE")
+    return df
 
 # --- SIDEBAR ---
 st.sidebar.header("🛡️ Battle Parameters")
@@ -64,7 +71,7 @@ target_strike = st.sidebar.number_input("Target Strike ($)", value=480.0, step=0
 contracts = st.sidebar.number_input("Contracts", value=5, min_value=1)
 
 # --- MAIN ---
-st.title("🛡️ Holdco Expiry Comparison (0-60 Days)")
+st.title("🛡️ Holdco Expiry Comparison (Full 60-Day Window)")
 curr_price, expirations, curr_vix = fetch_ticker_basics(ticker_sym)
 
 if curr_price:
@@ -74,18 +81,18 @@ if curr_price:
     m3.metric("Target Strike", f"${target_strike:.2f}")
 
     st.divider()
-    with st.spinner("Scanning 60-day Option Window..."):
+    with st.spinner(f"Analyzing all available expiries for {ticker_sym}..."):
         df_comp = compare_expiries(ticker_sym, target_strike, curr_price)
     
     if not df_comp.empty:
         # 1. VISUAL CHART
         fig = px.bar(df_comp, x='Expiry', y='Annualized Return', color='Annualized Return', 
                      color_continuous_scale='Blues', text_auto=True, 
-                     title="Yield Battle: Annualized Return % (Next 60 Days)")
+                     title=f"Yield Battle: Annualized Return % (Next {df_comp['DTE'].max()} Days)")
         st.plotly_chart(fig, use_container_width=True)
 
         # 2. DATA TABLE
-        st.subheader("60-Day Option Data Overview")
+        st.subheader(f"Detailed Option Data (Showing {len(df_comp)} Expiries)")
         df_styled = df_comp.copy()
         df_styled['Premium'] = df_styled['Premium'].map("${:,.2f}".format)
         df_styled['IV'] = (df_styled['IV'] * 100).map("{:,.1f}%".format)
@@ -100,7 +107,7 @@ if curr_price:
         
         # Logic Calc
         total_prem = row['Premium'] * contracts * 100
-        safety_margin = ((curr_price - row['Actual_Strike']) / curr_price) * 100 if 'Actual_Strike' in row else ((curr_price - row['Actual Strike']) / curr_price) * 100
+        safety_margin = ((curr_price - row['Actual Strike']) / curr_price) * 100
         pop = calculate_pop(curr_price, row['Actual Strike'], row['DTE']/365, row['IV'])
         
         col_a, col_b = st.columns(2)
@@ -120,5 +127,8 @@ if curr_price:
             st.success(f"🍁 **Tax-Free CDA Credit:** ${(total_prem * 0.5):,.2f}")
             st.warning(f"⚖️ **Passive Limit Use:** {(total_prem/50000)*100:.1f}% of $50k")
 
-    else: st.error("No valid option data found for this strike within 60 days.")
-else: st.error("Invalid Ticker or Connection Issue.")
+    else: 
+        st.error(f"No valid option data found for {ticker_sym} at a ${target_strike} strike within 60 days.")
+        st.info("Try adjusting the strike price closer to the current market price.")
+else: 
+    st.error("Invalid Ticker or Connection Issue.")
