@@ -46,41 +46,96 @@ def compare_expiries(symbol, target_strike, curr_price):
                 "Expiry": expiry,
                 "DTE": dte,
                 "Actual Strike": opt['strike'],
-                "Premium": f"${prem:.2f}",
-                "IV %": f"{opt['impliedVolatility']*100:.1f}%",
+                "Premium": prem,
+                "IV %": opt['impliedVolatility']*100,
                 "Annualized Return": round(ann_ret, 2)
             })
         except:
             continue
     return pd.DataFrame(comparison_data)
 
-# --- SIDEBAR & MAIN ---
-st.title("🛡️ Holdco Expiry Comparison")
+# --- SIDEBAR INPUTS ---
+st.sidebar.header("🛡️ Battle Parameters")
 ticker_sym = st.sidebar.text_input("Ticker", value="SPY").upper()
-target_strike = st.sidebar.number_input("Target Strike Price ($)", value=480.0)
+
+# Keypad-friendly number input
+target_strike = st.sidebar.number_input(
+    "Target Strike Price ($)", 
+    value=480.0, 
+    step=0.5, 
+    format="%.2f",
+    help="Double-click to type a specific strike using your keypad."
+)
+
+contracts = st.sidebar.number_input("Contracts (100 sh ea)", value=5, min_value=1)
+
+# --- MAIN INTERFACE ---
+st.title("🛡️ Holdco Expiry Comparison")
 
 curr_price, expirations, curr_vix = fetch_ticker_basics(ticker_sym)
 
 if curr_price:
-    st.metric(f"Current {ticker_sym} Price", f"${curr_price:.2f}", delta=f"VIX: {curr_vix:.2f}")
-    
+    # Top Level Metrics
+    m1, m2, m3 = st.columns(3)
+    m1.metric(f"{ticker_sym} Price", f"${curr_price:.2f}")
+    m2.metric("Market Fear (VIX)", f"{curr_vix:.2f}", delta="Panic Threshold: 20", delta_color="inverse")
+    m3.metric("Target Strike", f"${target_strike:.2f}")
+
     # --- COMPARISON LOGIC ---
-    st.subheader(f"Strategy: Puts near ${target_strike} Strike")
-    with st.spinner("Analyzing all expiry dates..."):
+    st.divider()
+    st.subheader(f"Battle Analysis: Puts near ${target_strike} Strike")
+    
+    with st.spinner("Scanning Option Chains..."):
         df_comp = compare_expiries(ticker_sym, target_strike, curr_price)
     
     if not df_comp.empty:
-        # Visualizing the Sweet Spot
+        # Charting the Sweet Spot
         fig = px.bar(df_comp, x='Expiry', y='Annualized Return', 
-                     title="Annualized Return by Expiry",
-                     color='Annualized Return', color_continuous_scale='Blues')
+                     title="Yield Battle: Annualized Return % by Expiry",
+                     color='Annualized Return', 
+                     color_continuous_scale='Blues',
+                     text_auto=True)
         st.plotly_chart(fig, use_container_width=True)
         
-        # Comparison Table
-        st.dataframe(df_comp, use_container_width=True, hide_index=True)
+        # Formatting the table for display
+        df_display = df_comp.copy()
+        df_display['Premium'] = df_display['Premium'].map("${:,.2f}".format)
+        df_display['IV %'] = df_display['IV %'].map("{:,.1f}%".format)
+        df_display['Annualized Return'] = df_display['Annualized Return'].map("{:,.2f}%".format)
         
-        st.info("💡 **Holdco Logic:** Longer dates (further right) usually have higher premiums but lower *Annualized Returns*. Look for the spike where IV is highest.")
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
+        
+        # --- HOLDCO STRATEGY CHECK ---
+        st.divider()
+        st.subheader("📋 Holdco Battle Checklist")
+        
+        # Selection for specific row logic
+        selected_expiry = st.selectbox("Select Expiry to Validate Strategy:", df_comp['Expiry'])
+        row = df_comp[df_comp['Expiry'] == selected_expiry].iloc[0]
+        
+        # Logic Variables
+        total_prem = float(row['Premium'].replace('$', '')) * contracts * 100 if isinstance(row['Premium'], str) else row['Premium'] * contracts * 100
+        safety_margin = ((curr_price - row['Actual Strike']) / curr_price) * 100
+        pass_impact = (total_prem / 50000) * 100
+        cda_credit = total_prem * 0.50
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            def check_ui(label, condition, val):
+                color = "green" if condition else "red"
+                icon = "✅" if condition else "❌"
+                st.markdown(f":{color}[{icon} {label}: **{val}**]")
+
+            check_ui("Market Fear (VIX > 20)", curr_vix > 20, f"{curr_vix:.2f}")
+            check_ui("Safety Margin (> 8% OTM)", safety_margin > 8, f"{safety_margin:.1f}%")
+            check_ui("Tax Shield (Premium < $4,166)", total_prem < 4166, f"${total_prem:,.2f}")
+        
+        with col_b:
+            st.write(f"🍁 **Tax-Free CDA Credit:** ${cda_credit:,.2f}")
+            st.write(f"⚖️ **Passive Threshold Use:** {pass_impact:.1f}%")
+            st.write(f"💰 **Cash Required:** ${(row['Actual Strike'] * contracts * 100):,.2f}")
+
     else:
-        st.error("No data found for this strike range.")
+        st.error("No valid option data found for this strike range.")
 else:
-    st.error("Invalid Ticker.")
+    st.error("Invalid Ticker or Data Connection Issue.")
