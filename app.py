@@ -80,7 +80,10 @@ with tab4:
 
     with col_summary:
         st.markdown("### Performance Summary")
-        if not st.session_state.trade_history.empty:
+       if not st.session_state.trade_history.empty:
+
+# TO THIS:
+if len(st.session_state.trade_history) > 0:
             df = st.session_state.trade_history
             
             # Filter for specific ticker
