@@ -1,246 +1,126 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 import numpy as np
-from datetime import datetime
-import plotly.express as px
 from scipy.stats import norm
+from datetime import datetime
 
-st.set_page_config(page_title="Holdco Lifecycle Terminal", layout="wide")
+# Page Config
+st.set_page_config(page_title="Technical Comparison Dashboard", layout="wide")
+st.title("📊 4-EMA Benchmark & Options Greeks")
 
-# --- 1. PERSISTENT LEDGER INITIALIZATION ---
-# Initializing as a DataFrame prevents the .empty crash
-if 'trade_history' not in st.session_state:
-    st.session_state.trade_history = pd.DataFrame(columns=[
-        "Date", "Ticker", "Type", "Strike", "Premium/sh", "Contracts", "Total PnL", "CDA Room", "ACB"
-    ])
-
-# --- 2. MATH & PROBABILITY FUNCTIONS ---
-def calculate_pop(S, K, t, sigma, r=0.04):
-    try:
-        if t <= 0 or sigma <= 0: return 0.5
-        d2 = (np.log(S / K) + (r - 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
-        return norm.cdf(d2)
-    except: return 0.5
-
-# --- 3. DATA FETCHING ---
-@st.cache_data(ttl=600)
-def fetch_ticker_basics(symbol):
-    try:
-        tk = yf.Ticker(symbol)
-        info = tk.info
-        price = info.get('regularMarketPrice') or info.get('previousClose')
-        vix_price = yf.Ticker("^VIX").info.get('regularMarketPrice') or 20.0
-        return price, tk.options, vix_price
-    except: return None, None, None
-
-@st.cache_data(ttl=600)
-def compare_options(symbol, target_strike, opt_type="put"):
-    tk = yf.Ticker(symbol)
-    comparison_data = []
-    for expiry in tk.options:
-        try:
-            expiry_dt = datetime.strptime(expiry, '%Y-%m-%d')
-            dte = (expiry_dt - datetime.now()).days
-            if 0 < dte <= 90:
-                chain = tk.option_chain(expiry)
-                options = chain.puts if opt_type == "put" else chain.calls
-                
-                if opt_type == "call":
-                    valid_opts = options[options['strike'] >= target_strike]
-                else:
-                    valid_opts = options[options['strike'] <= target_strike]
-                
-                if valid_opts.empty: continue
-                idx = (valid_opts['strike'] - target_strike).abs().idxmin()
-                opt = valid_opts.loc[idx]
-                if opt['lastPrice'] <= 0.01: continue
-                
-                ann_ret = round(((opt['lastPrice'] / opt['strike']) * (365 / dte) * 100), 2)
-                comparison_data.append({
-                    "Expiry": expiry, "DTE": dte, "Strike": opt['strike'],
-                    "Premium": opt['lastPrice'], "IV": opt['impliedVolatility'],
-                    "Ann. Return": ann_ret
-                })
-        except: continue
-    return pd.DataFrame(comparison_data).sort_values("DTE") if comparison_data else pd.DataFrame()
-
-# --- 4. GLOBAL SIDEBAR CONTROLS ---
-st.sidebar.header("🛡️ Strategy Controls")
-ticker_sym = st.sidebar.text_input("Active Ticker", value="SPY").upper()
-contracts = st.sidebar.number_input("Contracts (100 sh/ea)", value=5, min_value=1)
-
-curr_price, expirations, curr_vix = fetch_ticker_basics(ticker_sym)
-
-# --- 5. MAIN INTERFACE ---
-if curr_price:
-    m1, m2, m3 = st.columns(3)
-    m1.metric(f"{ticker_sym} Market Price", f"${curr_price:.2f}")
-    m2.metric("VIX (Fear Index)", f"{curr_vix:.2f}")
-    m3.metric("Capital Requirement (Unhedged)", f"${(curr_price * contracts * 100):,.0f}")
+# --- BLACK-SCHOLES CALCULATION ENGINE ---
+def calculate_greeks(S, K, T, r, sigma, option_type='put'):
+    """
+    S: Current Price, K: Strike, T: Time to Expiry (years), 
+    r: Risk-free rate (approx 0.04), sigma: IV
+    """
+    if T <= 0 or sigma <= 0: return 0, 0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
     
-    st.divider()
-    
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Battle Board", "🛡️ Insurance Layer", "🔄 Plan B", "📁 Lifecycle Ledger"])
-
-    # ==========================================
-    # TAB 1: BATTLE BOARD
-    # ==========================================
-    with tab1:
-        st.subheader("Phase 1: Put Scanning")
-        target_put = st.number_input("Target Put Strike ($)", value=curr_price * 0.95, step=1.0)
-        df_puts = compare_options(ticker_sym, target_put, "put")
-        if not df_puts.empty:
-            fig = px.bar(df_puts, x='Expiry', y='Ann. Return', color='Ann. Return', 
-                         color_continuous_scale='Blues', text_auto=True, title="Annualized Yield %")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            df_styled = df_puts.copy()
-            df_styled['Premium'] = df_styled['Premium'].map("${:,.2f}".format)
-            df_styled['Ann. Return'] = df_styled['Ann. Return'].map("{:,.2f}%".format)
-            
-            h = (len(df_styled) * 35) + 45
-            st.dataframe(df_styled, use_container_width=True, hide_index=True, height=h)
-        else:
-            st.warning("No option data found for this strike.")
-
-    # ==========================================
-    # TAB 2: INSURANCE LAYER
-    # ==========================================
-    with tab2:
-        st.subheader("The Hedged Entry (Bull Put Spread)")
-        c1, c2 = st.columns(2)
-        with c1:
-            sell_strike = st.number_input("Sell Strike (Target Support)", value=target_put, key="ins_sell")
-            sell_prem = st.number_input("Premium Received ($)", value=10.50)
-        with c2:
-            hedge_offset = st.slider("Hedge Offset (% below entry)", 2, 10, 5)
-            buy_strike = sell_strike * (1 - (hedge_offset/100))
-            st.write(f"Insurance Strike: **${buy_strike:.2f}**")
-            buy_cost = st.number_input("Insurance Cost ($)", value=2.50)
-
-        net_prem = sell_prem - buy_cost
-        max_risk_per_sh = (sell_strike - buy_strike) - net_prem
+    if option_type == 'put':
+        delta = norm.cdf(d1) - 1
+    else:
+        delta = norm.cdf(d1)
         
-        st.divider()
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Net Income/sh", f"${net_prem:.2f}")
-        r2.metric("Max Portfolio Risk", f"${(max_risk_per_sh * contracts * 100):,.2f}")
-        r3.metric("Est. CDA Credit", f"${(net_prem * 0.5 * contracts * 100):,.2f}")
+    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+    return delta, gamma
 
-# --- 3. DATA FETCHING ---
+# --- DATA FETCHING ---
 @st.cache_data(ttl=600)
-def fetch_ticker_basics(symbol):
+def get_technical_data(symbol, interval):
     try:
-        tk = yf.Ticker(symbol)
+        t_obj = yf.Ticker(symbol)
+        df = t_obj.history(period="max", interval=interval)
+        if df.empty or len(df) < 25: return None, None
         
-        # Use .history() instead of .info for extreme reliability
-        hist = tk.history(period="1d")
-        if hist.empty:
-            return None, None, None
-            
-        price = hist['Close'].iloc[-1]
+        # Technicals
+        df['EMA4'] = df['Close'].ewm(span=4, adjust=False).mean()
+        df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+        sma20 = df['Close'].rolling(window=20).mean()
+        std20 = df['Close'].rolling(window=20).std()
+        df['BB_Top'] = sma20 + (std20 * 2)
+        df['BB_Bot'] = sma20 - (std20 * 2)
+        df['BB_Width'] = ((df['BB_Top'] - df['BB_Bot']) / sma20) * 100
         
-        # Fetch VIX using the same robust method
-        try:
-            vix_hist = yf.Ticker("^VIX").history(period="1d")
-            vix_price = vix_hist['Close'].iloc[-1] if not vix_hist.empty else 20.0
-        except:
-            vix_price = 20.0 # Fallback fear gauge
-            
-        return price, tk.options, vix_price
+        # Stochastic (5,1)
+        low_5 = df['Low'].rolling(window=5).min()
+        high_5 = df['High'].rolling(window=5).max()
+        df['%K'] = (df['Close'] - low_5) / (high_5 - low_5) * 100
         
-    except Exception as e:
-        # This will print the exact error to your sidebar if it fails again
-        st.sidebar.error(f"Data Fetch Error: {e}") 
-        return None, None, None
+        return df, t_obj
+    except: return None, None
 
-    # ==========================================
-    # TAB 4: LIFECYCLE LEDGER & ACB TRACKER
-    # ==========================================
-    with tab4:
-        st.subheader("📋 Trade Lifecycle Management")
-        
-        col_input, col_summary = st.columns([1, 2])
-        
-        with col_input:
-            st.markdown("### Log New Event")
-            with st.form("lifecycle_form"):
-                t_date = st.date_input("Event Date", value=datetime.now())
-                t_type = st.selectbox("Transaction Type", [
-                    "Put Sold", "Bought Insurance", "Spread Closed (Net)", 
-                    "Assigned (Buy Shares)", "Call Sold", "Called Away (Sell Shares)"
-                ])
-                t_strike = st.number_input("Strike / Share Price", value=0.0)
-                t_prem = st.number_input("Premium / Cost per share", value=0.0)
-                t_qty = st.number_input("Contracts (100 sh ea)", min_value=1, value=contracts)
-                
-                st.caption("Fill below ONLY if Assigned or Called Away:")
-                t_prior_prem = st.number_input("Total Prior Premiums (for ACB calc)", value=0.0)
-                
-                submitted = st.form_submit_button("Commit to Ledger")
-                
-                if submitted:
-                    pnl = 0
-                    cda = 0
-                    acb = "N/A"
-                    
-                    # Logic Router based on Trade Type
-                    if t_type in ["Put Sold", "Call Sold", "Spread Closed (Net)"]:
-                        pnl = t_prem * t_qty * 100
-                        cda = pnl * 0.5 if pnl > 0 else 0
-                    elif t_type == "Bought Insurance":
-                        pnl = -(t_prem * t_qty * 100)
-                    elif t_type == "Assigned (Buy Shares)":
-                        pnl = -(t_strike * t_qty * 100) # Massive cash outflow
-                        acb = f"${(t_strike - t_prior_prem):.2f}" # Calculates your true break-even
-                    elif t_type == "Called Away (Sell Shares)":
-                        pnl = t_strike * t_qty * 100 # Massive cash inflow
-                        # Capital Gain = (Sell Price - (Strike Bought - Prior Premiums))
-                        cap_gain = (t_strike - (t_strike - t_prior_prem)) * t_qty * 100
-                        cda = cap_gain * 0.5 if cap_gain > 0 else 0
+# --- UI ---
+with st.sidebar:
+    st.header("Settings")
+    raw_tickers = st.text_area("Tickers", "AAPL, MSFT, NVDA, SPY")
+    tickers = [t.strip().upper() for t in raw_tickers.split(",") if t.strip()]
 
-                    new_row = pd.DataFrame([{
-                        "Date": t_date.strftime("%Y-%m-%d"), 
-                        "Ticker": ticker_sym, 
-                        "Type": t_type, 
-                        "Strike": t_strike, 
-                        "Premium/sh": t_prem, 
-                        "Contracts": t_qty, 
-                        "Total PnL": pnl, 
-                        "CDA Room": cda,
-                        "ACB": acb
-                    }])
-                    
-                    st.session_state.trade_history = pd.concat([st.session_state.trade_history, new_row], ignore_index=True)
-                    st.rerun()
+if tickers:
+    grid = st.columns(2)
+    for idx, ticker in enumerate(tickers):
+        with grid[idx % 2]:
+            with st.container(border=True):
+                st.header(ticker)
+                t_d, t_w, t_m = st.tabs(["Daily", "Weekly", "Monthly"])
+                for tab, interval in zip([t_d, t_w, t_m], ["1d", "1wk", "1mo"]):
+                    with tab:
+                        df, t_obj = get_technical_data(ticker, interval)
+                        if df is not None:
+                            last = df.iloc[-1]
+                            curr_p = float(last['Close'])
+                            
+                            # Standard Metrics
+                            c1, c2 = st.columns(2)
+                            c1.markdown(f"**Price:** `${curr_p:.2f}`")
+                            c2.markdown(f"**Stoch (5,1):** `{last['%K']:.1f}`")
 
-        with col_summary:
-            st.markdown("### Performance Summary")
-            # Safe check using len() to avoid the .empty bug
-            if len(st.session_state.trade_history) > 0:
-                df = st.session_state.trade_history
-                ticker_df = df[df["Ticker"] == ticker_sym]
-                
-                s1, s2, s3 = st.columns(3)
-                total_flow = ticker_df["Total PnL"].sum()
-                total_cda = ticker_df["CDA Room"].sum()
-                
-                s1.metric("Net Cash Flow", f"${total_flow:,.2f}", help="Includes cash used to buy shares if assigned.")
-                s2.metric("Total CDA Credit", f"${total_cda:,.2f}", help="Tax-free withdrawal room generated.")
-                s3.metric("Events Logged", len(ticker_df))
-                
-                st.divider()
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Full Tax Ledger", data=csv, file_name=f"holdco_{ticker_sym}_ledger.csv", mime="text/csv")
-                
-                if st.button("🗑️ Clear All Data"):
-                    st.session_state.trade_history = pd.DataFrame(columns=df.columns)
-                    st.rerun()
-            else:
-                st.info("No data logged. Record your first trade to begin tracking your Holdco performance.")
+                            # --- OPTIONS & GREEKS ---
+                            st.markdown("### 🎲 Options Analysis")
+                            expirations = t_obj.options
+                            if expirations:
+                                e1, e2 = st.columns(2)
+                                sel_exp = e1.selectbox(f"Expiry", expirations, key=f"e_{ticker}_{interval}")
+                                
+                                # Process expiration date for T (Time)
+                                exp_date = datetime.strptime(sel_exp, '%Y-%m-%d')
+                                days_to_expiry = (exp_date - datetime.now()).days
+                                T = max(days_to_expiry, 1) / 365.0
+                                
+                                opt_chain = t_obj.option_chain(sel_exp)
+                                puts = opt_chain.puts
+                                
+                                sel_strike = e2.selectbox(f"Strike", puts['strike'].tolist(), 
+                                                           index=len(puts)//2, key=f"s_{ticker}_{interval}")
+                                
+                                target_put = puts[puts['strike'] == sel_strike].iloc[0]
+                                iv = target_put['impliedVolatility']
+                                
+                                # Calculate Greeks
+                                delta, gamma = calculate_greeks(curr_p, sel_strike, T, 0.04, iv)
+                                
+                                g1, g2, g3, g4 = st.columns(4)
+                                g1.metric("Put Price", f"${target_put['lastPrice']:.2f}")
+                                g2.metric("IV", f"{iv*100:.1f}%")
+                                g3.metric("Delta", f"{delta:.3f}")
+                                g4.metric("Gamma", f"{gamma:.4f}")
+                            else:
+                                st.info("No options available.")
 
-else:
-    st.error("Invalid Ticker or Connection Issue. Please check the ticker symbol.")
+                            st.divider()
+                            st.markdown("### 🫧 Bollinger Analysis")
+                            # Proximity logic (Current vs BB 1%)
+                            dist_top = abs(curr_p - last['BB_Top']) / last['BB_Top']
+                            dist_bot = abs(curr_p - last['BB_Bot']) / last['BB_Bot']
+                            
+                            b1, b2 = st.columns(2)
+                            b1.write(f"Width: `{last['BB_Width']:.2f}%`")
+                            if dist_top <= 0.01 or curr_p >= last['BB_Top']:
+                                b2.error("🔥 Near/Above Upper BB")
+                            elif dist_bot <= 0.01 or curr_p <= last['BB_Bot']:
+                                b2.success("❄️ Near/Below Lower BB")
+                            else:
+                                b2.write("Position: Neutral")
+                        else: st.error(f"No data for {ticker}")
