@@ -128,29 +128,32 @@ if curr_price:
         r2.metric("Max Portfolio Risk", f"${(max_risk_per_sh * contracts * 100):,.2f}")
         r3.metric("Est. CDA Credit", f"${(net_prem * 0.5 * contracts * 100):,.2f}")
 
-    # ==========================================
-    # TAB 3: PLAN B (COVERED CALLS)
-    # ==========================================
-    with tab3:
-        st.subheader("Phase 3: Recovery (Covered Calls)")
-        assigned_at = st.number_input("Assigned Strike Price ($)", value=target_put)
-        total_put_prem = st.number_input("Total Prior Premium Collected ($)", value=10.50)
+# --- 3. DATA FETCHING ---
+@st.cache_data(ttl=600)
+def fetch_ticker_basics(symbol):
+    try:
+        tk = yf.Ticker(symbol)
         
-        breakeven = assigned_at - total_put_prem
-        st.metric("Net Cost Basis (ACB)", f"${breakeven:.2f}")
+        # Use .history() instead of .info for extreme reliability
+        hist = tk.history(period="1d")
+        if hist.empty:
+            return None, None, None
+            
+        price = hist['Close'].iloc[-1]
         
-        df_calls = compare_options(ticker_sym, assigned_at, "call")
-        if not df_calls.empty:
-            sel_call_expiry = st.selectbox("Select Call Expiry:", df_calls['Expiry'])
-            row_c = df_calls[df_calls['Expiry'] == sel_call_expiry].iloc[0]
+        # Fetch VIX using the same robust method
+        try:
+            vix_hist = yf.Ticker("^VIX").history(period="1d")
+            vix_price = vix_hist['Close'].iloc[-1] if not vix_hist.empty else 20.0
+        except:
+            vix_price = 20.0 # Fallback fear gauge
             
-            call_gain = (row_c['Strike'] - assigned_at) * contracts * 100
-            total_prof = call_gain + ((total_put_prem + row_c['Premium']) * contracts * 100)
-            
-            st.success(f"🚀 **Total Lifecycle Return if Called:** ${total_prof:,.2f}")
-            st.dataframe(df_calls, use_container_width=True, hide_index=True)
-        else:
-            st.warning("No calls available at this strike currently.")
+        return price, tk.options, vix_price
+        
+    except Exception as e:
+        # This will print the exact error to your sidebar if it fails again
+        st.sidebar.error(f"Data Fetch Error: {e}") 
+        return None, None, None
 
     # ==========================================
     # TAB 4: LIFECYCLE LEDGER & ACB TRACKER
